@@ -67,6 +67,24 @@ settings:
 - `!unpair` — disconnect this channel from the Vicuna session
 - `!help` — list commands
 
+## Troubleshooting
+
+### Can't DM the bot (no Messages tab or message box is disabled)
+
+This happens if the Slack app was created **From scratch** instead of **From a manifest**:
+
+1. Open your app in [Slack API Apps](https://api.slack.com/apps).
+2. Go to **App Home** → scroll to **Show Tabs**.
+3. Turn **Messages Tab** ON.
+4. Once Messages Tab is ON, check **Allow users to send Slash commands and messages from the messages tab** (this checkbox is hidden until Messages Tab is turned on).
+5. Optional: turn **Home Tab** OFF so clicking the bot opens straight to Messages.
+6. Reload Slack (`Cmd+R` / `Ctrl+R`).
+
+### `!pair <code>` gets no response
+
+- Make sure you send `!pair <code>` in a **direct message** to the bot or a **private channel** the bot was invited to (not a public `#channel`).
+- If you didn't use the Manifest YAML above, verify under **OAuth & Permissions** that your Bot Token has `chat:write`, `im:history`, `im:read`, `im:write`, `groups:history`, `groups:read`, `files:read`, and `users:read`, and under **Event Subscriptions → Subscribe to bot events** that `message.im` and `message.groups` are added — then click **Reinstall to Workspace** (your `xoxb-…` token stays the same).
+
 ## Build Locally
 
 ```bash

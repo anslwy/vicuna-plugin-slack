@@ -172,11 +172,25 @@ pub fn validate_app_token_format(token: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn strip_leading_mention(text: &str) -> &str {
+    let mut t = text.trim();
+    if let Some(rest) = t.strip_prefix("<@") {
+        if let Some(end) = rest.find('>') {
+            let after = rest[end + 1..].trim_start();
+            t = after
+                .strip_prefix(':')
+                .map(str::trim_start)
+                .unwrap_or(after);
+        }
+    }
+    t
+}
+
 pub fn is_pair_attempt(text: &str, code: &str) -> bool {
     if code.is_empty() {
         return false;
     }
-    let t = text.trim();
+    let t = strip_leading_mention(text);
     let t = t.strip_prefix("!pair").map(str::trim).unwrap_or(t);
     t == code
 }
@@ -430,7 +444,51 @@ async fn update_message(
     if let Some(b) = blocks {
         body["blocks"] = b;
     }
-    let _ = slack_api_post(bot_token, "chat.update", Some(body)).await;
+    if let Err(e) = slack_api_post(bot_token, "chat.update", Some(body)).await {
+        eprintln!("vicuna-plugin-slack: {e}");
+    }
+}
+
+/// One async lock per progress message. Progress edits (12 s ticker, tool and
+/// progress notifications) and the final reply all edit the same Slack
+/// message; without this an edit built from stale state could land after the
+/// final `chat.update` and overwrite the reply.
+type MsgLocks = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+fn msg_locks() -> std::sync::MutexGuard<'static, HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static M: OnceLock<MsgLocks> = OnceLock::new();
+    M.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn msg_lock(ts: &str) -> Arc<tokio::sync::Mutex<()>> {
+    msg_locks().entry(ts.to_string()).or_default().clone()
+}
+
+/// Forget a message's lock once its final edit landed (the map only grows otherwise).
+fn drop_msg_lock(ts: &str) {
+    msg_locks().remove(ts);
+}
+
+/// Edit the progress message from the turn's CURRENT state, under the
+/// message lock; a turn that already finished owns nothing to edit.
+async fn update_progress(
+    bot_token: &str,
+    channel: &str,
+    ts: &str,
+    sid: &str,
+    turn_id: &str,
+) -> bool {
+    let lock = msg_lock(ts);
+    let _g = lock.lock().await;
+    let content = rt().lock().ok().and_then(|r| {
+        let state = r.bridges.get(sid)?.turns.get(turn_id)?;
+        Some(progress_content(state, Instant::now()))
+    });
+    let Some(content) = content else { return false };
+    update_message(bot_token, channel, ts, &content, None).await;
+    true
 }
 
 async fn lookup_user_name(bot_token: &str, user_id: &str) -> String {
@@ -694,7 +752,7 @@ pub enum Command {
 }
 
 pub fn parse_command(text: &str) -> Option<Command> {
-    let t = text.trim();
+    let t = strip_leading_mention(text);
     if t == "!help" {
         return Some(Command::Help);
     }
@@ -1127,20 +1185,9 @@ async fn handle_turn_event(params: &Value) {
                     tick.tick().await; // skip immediate tick
                     loop {
                         tick.tick().await;
-                        let state = rt().lock().ok().and_then(|r| {
-                            r.bridges
-                                .get(&sid)
-                                .and_then(|b| b.turns.get(&turn_id).cloned())
-                        });
-                        let Some(state) = state else { break };
-                        update_message(
-                            &token,
-                            &channel_id,
-                            &ts,
-                            &progress_content(&state, Instant::now()),
-                            None,
-                        )
-                        .await;
+                        if !update_progress(&token, &channel_id, &ts, &sid, &turn_id).await {
+                            break;
+                        }
                     }
                 });
             }
@@ -1150,7 +1197,7 @@ async fn handle_turn_event(params: &Value) {
             if text.is_empty() {
                 return;
             }
-            let (ts, content) = rt()
+            let ts = rt()
                 .lock()
                 .ok()
                 .and_then(|mut r| {
@@ -1169,11 +1216,11 @@ async fn handle_turn_event(params: &Value) {
                             state.tool_started = Some(Instant::now());
                         }
                     }
-                    Some((ts, progress_content(state, Instant::now())))
+                    Some(ts)
                 })
                 .unwrap_or_default();
             if !ts.is_empty() {
-                update_message(&cfg.bot_token, &channel_id, &ts, &content, None).await;
+                update_progress(&cfg.bot_token, &channel_id, &ts, sid, &turn_id).await;
             }
         }
         "toolstart" => {
@@ -1190,7 +1237,7 @@ async fn handle_turn_event(params: &Value) {
             } else {
                 format!("{name}: {detail}")
             };
-            let (ts, content) = rt()
+            let ts = rt()
                 .lock()
                 .ok()
                 .and_then(|mut r| {
@@ -1200,15 +1247,15 @@ async fn handle_turn_event(params: &Value) {
                     state.current_tool = Some(name.to_string());
                     state.tool_started = Some(Instant::now());
                     state.tool_lines.push(compact_tool_line(&label));
-                    Some((ts, progress_content(state, Instant::now())))
+                    Some(ts)
                 })
                 .unwrap_or_default();
             if !ts.is_empty() {
-                update_message(&cfg.bot_token, &channel_id, &ts, &content, None).await;
+                update_progress(&cfg.bot_token, &channel_id, &ts, sid, &turn_id).await;
             }
         }
         "toolend" => {
-            let (ts, content) = rt()
+            let ts = rt()
                 .lock()
                 .ok()
                 .and_then(|mut r| {
@@ -1217,11 +1264,11 @@ async fn handle_turn_event(params: &Value) {
                     let state = b.turns.get_mut(&turn_id)?;
                     state.current_tool = None;
                     state.tool_started = None;
-                    Some((ts, progress_content(state, Instant::now())))
+                    Some(ts)
                 })
                 .unwrap_or_default();
             if !ts.is_empty() {
-                update_message(&cfg.bot_token, &channel_id, &ts, &content, None).await;
+                update_progress(&cfg.bot_token, &channel_id, &ts, sid, &turn_id).await;
             }
         }
         "error" => {
@@ -1239,7 +1286,11 @@ async fn handle_turn_event(params: &Value) {
                     .get(sid)
                     .and_then(|b| b.progress_ts.get(&turn_id).cloned())
             }) {
+                let lock = msg_lock(&ts);
+                let _g = lock.lock().await;
                 update_message(&cfg.bot_token, &channel_id, &ts, &marker, None).await;
+                drop(_g);
+                drop_msg_lock(&ts);
             }
         }
         "ask" => {
@@ -1280,7 +1331,13 @@ async fn handle_turn_event(params: &Value) {
             let parts = chunks(&reply);
             let mut it = parts.iter();
             if let (Some(t), Some(first)) = (ts, it.next()) {
+                // the turn is already removed above, so any progress edit
+                // waiting on this lock sees no state and skips
+                let lock = msg_lock(&t);
+                let _g = lock.lock().await;
                 update_message(&cfg.bot_token, &channel_id, &t, first, None).await;
+                drop(_g);
+                drop_msg_lock(&t);
             } else if let Some(first) = parts.first() {
                 post_message(&cfg.bot_token, &channel_id, first, None).await;
             }
@@ -2465,9 +2522,20 @@ mod tests {
         assert_eq!(parsed.action_id, "a:1");
     }
 
+    #[tokio::test]
+    async fn progress_edit_after_finish_is_skipped() {
+        // the final reply removed the turn: a late ticker/progress edit must
+        // not touch the message (no HTTP is attempted, so this needs no network)
+        let sent = update_progress("xoxb-x", "C1", "1.0", "no-such-bridge", "turn").await;
+        assert!(!sent);
+        drop_msg_lock("1.0");
+    }
+
     #[test]
     fn command_parsing_covers_all_commands() {
         assert_eq!(parse_command("!help"), Some(Command::Help));
+        assert_eq!(parse_command("<@U0123456> !status"), Some(Command::Status));
+        assert!(is_pair_attempt("<@U0123456> !pair 463985", "463985"));
         assert_eq!(parse_command("!status"), Some(Command::Status));
         assert_eq!(parse_command("!stop"), Some(Command::Stop));
         assert_eq!(parse_command("!now"), Some(Command::SendNow));

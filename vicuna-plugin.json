@@ -1,7 +1,7 @@
 {
   "id": "slack",
   "name": "Slack",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "icon": "slack.svg",
   "description": "Talk to any Vicuna Work session from Slack DMs or private channels over Socket Mode, with pairing, live progress, interactive buttons, and file attachments.",
   "bridge": {
@@ -11,15 +11,23 @@
     "tokenPlaceholder": "xoxb-…",
     "setupSteps": [
       {
-        "text": "Create a Slack app with Socket Mode & Interactivity in",
+        "text": "Open Slack API Apps → Create New App → From a manifest (not From scratch):",
         "linkText": "Slack API Apps",
         "linkUrl": "https://api.slack.com/apps"
       },
       {
-        "text": "Install it to your workspace and copy the Bot User OAuth Token (xoxb-…) from OAuth & Permissions."
+        "text": "Paste the Manifest YAML (sets up DMs, scopes, events, Socket Mode & Interactivity automatically) from the",
+        "linkText": "Slack plugin README",
+        "linkUrl": "https://github.com/anslwy/vicuna-plugin-slack#create-a-slack-app-manifest-yaml"
       },
       {
-        "text": "Paste the Bot Token below, then paste an App-Level Token (xapp-…, scope connections:write) when prompted."
+        "text": "Click Create, then Install to Workspace (OAuth & Permissions) and copy the Bot User OAuth Token (xoxb-…)."
+      },
+      {
+        "text": "Under Basic Information → App-Level Tokens, generate a token with scope connections:write (xapp-…)."
+      },
+      {
+        "text": "Paste xoxb-… below, then xapp-… when prompted. Finally, DM the bot !pair <code> in Slack (not a public channel). If you created the app From scratch, turn ON Messages Tab + \"Allow users to send Slash commands and messages\" under App Home."
       }
     ],
     "pairCommand": "!pair",
