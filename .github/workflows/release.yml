@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-musl
+            bin_name: vicuna-bridge-slack
+            asset_name: vicuna-bridge-slack-linux-x86_64
+          - platform: linux-aarch64
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            bin_name: vicuna-bridge-slack
+            asset_name: vicuna-bridge-slack-linux-aarch64
+          - platform: macos-aarch64
+            os: macos-latest
+            rust_target: aarch64-apple-darwin
+            bin_name: vicuna-bridge-slack
+            asset_name: vicuna-bridge-slack-macos-aarch64
+          - platform: macos-x86_64
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+            bin_name: vicuna-bridge-slack
+            asset_name: vicuna-bridge-slack-macos-x86_64
+          - platform: windows-x86_64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            bin_name: vicuna-bridge-slack.exe
+            asset_name: vicuna-bridge-slack-windows-x86_64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install musl toolchain (Linux)
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Run unit tests (native host)
+        if: matrix.platform == 'linux-x86_64'
+        run: cargo test
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          case "${{ matrix.rust_target }}" in
+            x86_64-unknown-linux-musl) export CC_x86_64_unknown_linux_musl=musl-gcc ;;
+            aarch64-unknown-linux-musl) export CC_aarch64_unknown_linux_musl=musl-gcc ;;
+          esac
+          cargo build --release --target "${{ matrix.rust_target }}"
+          mkdir -p dist
+          cp "target/${{ matrix.rust_target }}/release/${{ matrix.bin_name }}" "dist/${{ matrix.asset_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.platform }}
+          path: dist/${{ matrix.asset_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          cp vicuna-plugin.json slack.svg artifacts/
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber artifacts/*
+          else
+            gh release create "$TAG" artifacts/* \
+              --title "Vicuna Slack Bridge $TAG" \
+              --generate-notes
+          fi
