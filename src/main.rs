@@ -382,8 +382,13 @@ async fn slack_api_post(token: &str, method: &str, body: Option<Value>) -> Resul
     slack_api_post_at(&api_base(), token, method, body).await
 }
 
-async fn slack_api_get(token: &str, method: &str, query: &[(&str, &str)]) -> Result<Value, String> {
-    let url = format!("{}/{}", api_base().trim_end_matches('/'), method);
+async fn slack_api_get_at(
+    base: &str,
+    token: &str,
+    method: &str,
+    query: &[(&str, &str)],
+) -> Result<Value, String> {
+    let url = format!("{}/{}", base.trim_end_matches('/'), method);
     let resp = http()
         .get(&url)
         .bearer_auth(token)
@@ -406,6 +411,87 @@ async fn slack_api_get(token: &str, method: &str, query: &[(&str, &str)]) -> Res
         return Err(format!("slack {method}: {err}"));
     }
     Ok(v)
+}
+
+async fn slack_api_get(token: &str, method: &str, query: &[(&str, &str)]) -> Result<Value, String> {
+    slack_api_get_at(&api_base(), token, method, query).await
+}
+
+async fn upload_image_at(
+    base: &str,
+    bot_token: &str,
+    channel_id: &str,
+    bytes: Vec<u8>,
+    mime: &str,
+    filename: &str,
+    caption: Option<&str>,
+) -> Result<(), String> {
+    let len_str = bytes.len().to_string();
+    let step1 = slack_api_get_at(
+        base,
+        bot_token,
+        "files.getUploadURLExternal",
+        &[("filename", filename), ("length", len_str.as_str())],
+    )
+    .await?;
+    let upload_url = step1
+        .get("upload_url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "slack files.getUploadURLExternal: missing upload_url".to_string())?;
+    let file_id = step1
+        .get("file_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "slack files.getUploadURLExternal: missing file_id".to_string())?;
+
+    let upload_resp = http()
+        .post(upload_url)
+        .header("Content-Type", mime)
+        .body(bytes)
+        .send()
+        .await
+        .map_err(|e| format!("slack upload_url POST: {}", e.without_url()))?;
+    let upload_status = upload_resp.status();
+    if !upload_status.is_success() {
+        return Err(format!("slack upload_url POST: HTTP {upload_status}"));
+    }
+
+    let mut complete_body = json!({
+        "files": [{ "id": file_id, "title": filename }],
+        "channel_id": channel_id,
+    });
+    if let Some(c) = caption.map(str::trim).filter(|s| !s.is_empty()) {
+        complete_body["initial_comment"] = Value::String(c.to_string());
+    }
+    slack_api_post_at(
+        base,
+        bot_token,
+        "files.completeUploadExternal",
+        Some(complete_body),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn upload_image(
+    bot_token: &str,
+    channel_id: &str,
+    bytes: Vec<u8>,
+    mime: &str,
+    filename: &str,
+    caption: Option<&str>,
+) -> Result<(), String> {
+    upload_image_at(
+        &api_base(),
+        bot_token,
+        channel_id,
+        bytes,
+        mime,
+        filename,
+        caption,
+    )
+    .await
 }
 
 async fn post_message(
@@ -1314,6 +1400,43 @@ async fn handle_turn_event(params: &Value) {
                 .unwrap_or(false);
             let (text, blocks) = build_ask_payload(q, &opts, freeform);
             post_message(&cfg.bot_token, &channel_id, &text, blocks).await;
+        }
+        "image" => {
+            let Some(data) = params.get("data").and_then(Value::as_str) else {
+                eprintln!("vicuna-plugin-slack: image event missing data for session {sid}");
+                return;
+            };
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(data) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "vicuna-plugin-slack: failed to decode base64 image for session {sid}: {e}"
+                    );
+                    return;
+                }
+            };
+            let mime = params
+                .get("mime")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("image/png");
+            let filename = params
+                .get("filename")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("image.png");
+            let caption = params
+                .get("caption")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Err(e) =
+                upload_image(&cfg.bot_token, &channel_id, bytes, mime, filename, caption).await
+            {
+                eprintln!(
+                    "vicuna-plugin-slack: failed to upload image {filename} to {channel_id}: {e}"
+                );
+            }
         }
         "finished" => {
             let reply = params
@@ -2652,5 +2775,150 @@ mod tests {
             &json!({"type":"message","subtype":"file_share","user":"U1","text":""}),
             &bots
         ));
+    }
+
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        let header_end = loop {
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                return (String::from_utf8_lossy(&raw).into_owned(), Vec::new());
+            }
+            raw.extend_from_slice(&buf[..n]);
+            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+        let content_len: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                if k.eq_ignore_ascii_case("content-length") {
+                    v.trim().parse().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        while raw.len() < header_end + content_len {
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+        let body = raw[header_end..(header_end + content_len).min(raw.len())].to_vec();
+        (headers, body)
+    }
+
+    #[tokio::test]
+    async fn three_step_image_upload() {
+        #[derive(Default)]
+        struct Recorded {
+            step1_query: Option<String>,
+            step1_auth: Option<String>,
+            step2_content_type: Option<String>,
+            step2_bytes: Option<Vec<u8>>,
+            step3_auth: Option<String>,
+            step3_body: Option<Value>,
+        }
+
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let rec_srv = recorded.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let rec = rec_srv.clone();
+                tokio::spawn(async move {
+                    let (headers, body) = read_http_request(&mut sock).await;
+                    let first = headers.lines().next().unwrap_or("").to_string();
+                    let auth = headers.lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("authorization")
+                            .then(|| v.trim().to_string())
+                    });
+                    let content_type = headers.lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-type")
+                            .then(|| v.trim().to_string())
+                    });
+
+                    let (status, resp_body) =
+                        if first.starts_with("GET /files.getUploadURLExternal") {
+                            let mut r = rec.lock().unwrap();
+                            r.step1_query = Some(first.clone());
+                            r.step1_auth = auth;
+                            (
+                                "200 OK",
+                                json!({
+                                    "ok": true,
+                                    "upload_url": format!("http://{addr}/upload/F_TEST_1"),
+                                    "file_id": "F_TEST_1"
+                                })
+                                .to_string(),
+                            )
+                        } else if first.starts_with("POST /upload/F_TEST_1") {
+                            let mut r = rec.lock().unwrap();
+                            r.step2_content_type = content_type;
+                            r.step2_bytes = Some(body);
+                            ("200 OK", "OK - 12".to_string())
+                        } else if first.starts_with("POST /files.completeUploadExternal") {
+                            let mut r = rec.lock().unwrap();
+                            r.step3_auth = auth;
+                            r.step3_body = serde_json::from_slice(&body).ok();
+                            ("200 OK", json!({ "ok": true, "files": [] }).to_string())
+                        } else {
+                            (
+                                "404 Not Found",
+                                json!({ "ok": false, "error": "not_found" }).to_string(),
+                            )
+                        };
+
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let payload = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+        upload_image_at(
+            &format!("http://{addr}"),
+            "xoxb-test-token",
+            "C_CHAN_1",
+            payload.clone(),
+            "image/png",
+            "chart.png",
+            Some("Here is the chart"),
+        )
+        .await
+        .expect("3-step upload should succeed");
+
+        let r = recorded.lock().unwrap();
+        let q = r.step1_query.as_deref().unwrap_or("");
+        assert!(q.contains("filename=chart.png"), "{q}");
+        assert!(q.contains("length=12"), "{q}");
+        assert_eq!(r.step1_auth.as_deref(), Some("Bearer xoxb-test-token"));
+        assert_eq!(r.step2_content_type.as_deref(), Some("image/png"));
+        assert_eq!(r.step2_bytes.as_deref(), Some(payload.as_slice()));
+        assert_eq!(r.step3_auth.as_deref(), Some("Bearer xoxb-test-token"));
+        assert_eq!(
+            r.step3_body,
+            Some(json!({
+                "files": [{ "id": "F_TEST_1", "title": "chart.png" }],
+                "channel_id": "C_CHAN_1",
+                "initial_comment": "Here is the chart"
+            }))
+        );
     }
 }

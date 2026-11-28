@@ -41,6 +41,7 @@ oauth_config:
       - groups:history
       - groups:read
       - files:read
+      - files:write
       - users:read
 settings:
   event_subscriptions:
@@ -83,7 +84,11 @@ This happens if the Slack app was created **From scratch** instead of **From a m
 ### `!pair <code>` gets no response
 
 - Make sure you send `!pair <code>` in a **direct message** to the bot or a **private channel** the bot was invited to (not a public `#channel`).
-- If you didn't use the Manifest YAML above, verify under **OAuth & Permissions** that your Bot Token has `chat:write`, `im:history`, `im:read`, `im:write`, `groups:history`, `groups:read`, `files:read`, and `users:read`, and under **Event Subscriptions → Subscribe to bot events** that `message.im` and `message.groups` are added — then click **Reinstall to Workspace** (your `xoxb-…` token stays the same).
+- If you didn't use the Manifest YAML above, verify under **OAuth & Permissions** that your Bot Token has `chat:write`, `im:history`, `im:read`, `im:write`, `groups:history`, `groups:read`, `files:read`, `files:write`, and `users:read`, and under **Event Subscriptions → Subscribe to bot events** that `message.im` and `message.groups` are added — then click **Reinstall to Workspace** (your `xoxb-…` token stays the same).
+
+### Assistant images aren't appearing in Slack
+
+- Sending images back to Slack requires the `files:write` Bot Token scope. Under **OAuth & Permissions → Scopes → Bot Token Scopes**, add `files:write`, then click **Reinstall to Workspace** (your `xoxb-…` token stays the same).
 
 ## Build Locally
 
